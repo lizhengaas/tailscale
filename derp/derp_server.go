@@ -26,6 +26,7 @@ import (
 	"net/netip"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -157,13 +158,33 @@ type Server struct {
 	// local).
 	clientsMesh map[key.NodePublic]PacketForwarder
 	// sentTo tracks which peers have sent to which other peers,
-	// and at which connection number. This isn't on sclient
-	// because it includes intra-region forwarded packets as the
-	// src.
-	sentTo map[key.NodePublic]map[key.NodePublic]int64 // src => dst => dst's latest sclient.connNum
+	// at which connection number, and how many packets/bytes were
+	// sent per connection. This isn't on sclient because it
+	// includes intra-region forwarded packets as the src.
+	sentTo map[key.NodePublic]map[key.NodePublic]flowData
 
 	// maps from netip.AddrPort to a client's public key
 	keyOfAddr map[netip.AddrPort]key.NodePublic
+}
+
+// Per connection statistics for observability of who is using the
+// server and why, including intra-region forwarded packets, kept in
+// the sentTo map in the server. Accessed only under s.mu.
+type flowData struct {
+	// TODO: why is connNum signed?
+	connNum int64  // unique number per src->dest connection
+	pkts    uint64 // total packets sent on this connection
+	bytes   uint64 // total bytes
+}
+
+// updateFlowStats tracks how much data is flowing between a src and
+// dst client pair. Currently it only records for local destination
+// clients. Only call when holding S.mu and the key always exists.
+func (s *Server) updateFlowStatsLocked(src key.NodePublic, dst *sclient, contents []byte) {
+	f := s.sentTo[src][dst.key]
+	f.pkts += 1
+	f.bytes += uint64(len(contents))
+	s.sentTo[src][dst.key] = f
 }
 
 // clientSet represents 1 or more *sclients.
@@ -314,7 +335,7 @@ func NewServer(privateKey key.NodePrivate, logf logger.Logf) *Server {
 		netConns:             map[Conn]chan struct{}{},
 		memSys0:              ms.Sys,
 		watchers:             map[*sclient]bool{},
-		sentTo:               map[key.NodePublic]map[key.NodePublic]int64{},
+		sentTo:               map[key.NodePublic]map[key.NodePublic]flowData{},
 		avgQueueDuration:     new(uint64),
 		tcpRtt:               metrics.LabelMap{Label: "le"},
 		keyOfAddr:            map[netip.AddrPort]key.NodePublic{},
@@ -610,13 +631,13 @@ func (s *Server) notePeerGoneFromRegionLocked(key key.NodePublic) {
 	// so they can drop their route entries to us (issue 150)
 	// or move them over to the active client (in case a replaced client
 	// connection is being unregistered).
-	for pubKey, connNum := range s.sentTo[key] {
+	for pubKey, flow := range s.sentTo[key] {
 		set, ok := s.clients[pubKey]
 		if !ok {
 			continue
 		}
 		set.ForeachClient(func(peer *sclient) {
-			if peer.connNum == connNum {
+			if peer.connNum == flow.connNum {
 				go peer.requestPeerGoneWrite(key, PeerGoneReasonDisconnected)
 			}
 		})
@@ -896,6 +917,7 @@ func (c *sclient) handleFrameForwardPacket(ft frameType, fl uint32) error {
 	}
 	if dst != nil {
 		s.notePeerSendLocked(srcKey, dst)
+		s.updateFlowStatsLocked(srcKey, dst, contents)
 	}
 	s.mu.Unlock()
 
@@ -925,10 +947,12 @@ func (c *sclient) handleFrameForwardPacket(ft frameType, fl uint32) error {
 func (s *Server) notePeerSendLocked(src key.NodePublic, dst *sclient) {
 	m, ok := s.sentTo[src]
 	if !ok {
-		m = map[key.NodePublic]int64{}
+		m = map[key.NodePublic]flowData{}
 		s.sentTo[src] = m
 	}
-	m[dst.key] = dst.connNum
+	f := m[dst.key]
+	f.connNum = dst.connNum
+	m[dst.key] = f
 }
 
 // handleFrameSendPacket reads a "send packet" frame from the client.
@@ -951,9 +975,11 @@ func (c *sclient) handleFrameSendPacket(ft frameType, fl uint32) error {
 	}
 	if dst != nil {
 		s.notePeerSendLocked(c.key, dst)
+		s.updateFlowStatsLocked(c.key, dst, contents)
 	} else if dstLen < 1 {
 		fwd = s.clientsMesh[dstKey]
 	}
+
 	s.mu.Unlock()
 
 	if dst == nil {
@@ -962,7 +988,8 @@ func (c *sclient) handleFrameSendPacket(ft frameType, fl uint32) error {
 			err := fwd.ForwardPacket(c.key, dstKey, contents)
 			c.debug("SendPacket for %s, forwarding via %s: %v", dstKey.ShortString(), fwd, err)
 			if err != nil {
-				// TODO:
+				// TODO: anything else other than record the drop?
+				s.recordDrop(contents, c.key, dstKey, dropReasonUnknownDestOnFwd)
 				return nil
 			}
 			return nil
@@ -1929,6 +1956,43 @@ func (s *Server) ServeDebugTraffic(w http.ResponseWriter, r *http.Request) {
 		}
 		time.Sleep(minTimeBetweenLogs)
 	}
+}
+
+// Print a list of data flows that have gone through this server
+// between connected clients. Includes clients which are currently
+// communicating directly but still using this DERP server as their
+// home.
+//
+// TODO: What else do we want to know? Time connection was
+// established? Time since last packet? Average bandwidth?
+//
+// TODO: Convert into Prometheus histograms
+func (s *Server) ServeDebugFlows(w http.ResponseWriter, r *http.Request) {
+	// Lock, then copy out the current map, then unlock
+	fmt.Fprintf(w, "src dst bytes packets\n")
+	s.mu.Lock()
+	// Copy the whole map into our sortable data structure so we
+	// can drop the server lock quickly
+	type flowLine struct {
+		src, dst key.NodePublic
+		flw      flowData
+	}
+	flows := make([]flowLine, 0)
+	for src := range s.sentTo {
+		for dst, flw := range s.sentTo[src] {
+			flows = append(flows, flowLine{src, dst, flw})
+		}
+	}
+	s.mu.Unlock()
+
+	// Sort by largest flow
+	sort.Slice(flows, func(i, j int) bool { return flows[i].flw.bytes < flows[j].flw.bytes })
+
+	for _, f := range flows {
+		fmt.Fprintf(w, "%v %v %v %v\n", f.src.ShortString(), f.dst.ShortString(), f.flw.bytes, f.flw.pkts)
+	}
+
+	w.(http.Flusher).Flush()
 }
 
 var bufioWriterPool = &sync.Pool{
