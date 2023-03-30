@@ -78,7 +78,7 @@ func TestHeaderChecksums(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			p.Decode(tt.packet)
 			t.Log(p.String())
-			p.UpdateSrcAddr(netip.MustParseAddr("100.64.0.1"))
+			p.UpdateSrcAddr(netip.MustParseAddr("100.64.0.1"), false)
 
 			got := binary.BigEndian.Uint16(tt.packet[10:12])
 			want := fullHeaderChecksumV4(tt.packet[:20])
@@ -86,7 +86,7 @@ func TestHeaderChecksums(t *testing.T) {
 				t.Fatalf("got %x want %x", got, want)
 			}
 
-			p.UpdateDstAddr(netip.MustParseAddr("100.64.0.2"))
+			p.UpdateDstAddr(netip.MustParseAddr("100.64.0.2"), false)
 			got = binary.BigEndian.Uint16(tt.packet[10:12])
 			want = fullHeaderChecksumV4(tt.packet[:20])
 			if got != want {

@@ -15,6 +15,7 @@ import (
 
 	_ "embed"
 
+	"tailscale.com/net/packet"
 	"tailscale.com/util/set"
 )
 
@@ -26,7 +27,7 @@ var DissectorLua string
 // Such callbacks must not take ownership of the
 // provided data slice: it may only copy out of it
 // within the lifetime of the function.
-type Callback func(Path, time.Time, []byte)
+type Callback func(Path, time.Time, []byte, *packet.CaptureMeta)
 
 var bufferPool = sync.Pool{
 	New: func() any {
@@ -159,24 +160,53 @@ func (s *Sink) WaitCh() <-chan struct{} {
 	return s.ctx.Done()
 }
 
+func customDataLen(meta *packet.CaptureMeta) int {
+	if meta == nil {
+		return 4 // just the u16 'path', u8 snat len == 0, u8 dnat len == 0
+	}
+	length := 4
+	if meta.SNAT {
+		length += meta.OriginalSrc.Addr().BitLen() / 8
+	}
+	if meta.DNAT {
+		length += meta.OriginalDst.Addr().BitLen() / 8
+	}
+	return length
+}
+
 // LogPacket is called to insert a packet into the capture.
 //
 // This function does not take ownership of the provided data slice.
-func (s *Sink) LogPacket(path Path, when time.Time, data []byte) {
+func (s *Sink) LogPacket(path Path, when time.Time, data []byte, meta *packet.CaptureMeta) {
 	select {
 	case <-s.ctx.Done():
 		return
 	default:
 	}
 
+	extraLen := customDataLen(meta)
 	b := bufferPool.Get().(*bytes.Buffer)
 	b.Reset()
-	b.Grow(16 + 2 + len(data)) // 16b pcap header + 2b custom data + len
+	b.Grow(16 + extraLen + len(data)) // 16b pcap header + len(metadata) + len(payload)
 	defer bufferPool.Put(b)
 
-	writePktHeader(b, when, len(data)+2)
+	writePktHeader(b, when, len(data)+extraLen)
+
 	// Custom tailscale debugging data
 	binary.Write(b, binary.LittleEndian, uint16(path))
+	if meta != nil && meta.SNAT {
+		binary.Write(b, binary.LittleEndian, uint8(meta.OriginalSrc.Addr().BitLen()/8))
+		b.Write(meta.OriginalSrc.Addr().AsSlice())
+	} else {
+		binary.Write(b, binary.LittleEndian, uint8(0)) // SNAT addr len == 0
+	}
+	if meta != nil && meta.DNAT {
+		binary.Write(b, binary.LittleEndian, uint8(meta.OriginalDst.Addr().BitLen()/8))
+		b.Write(meta.OriginalDst.Addr().AsSlice())
+	} else {
+		binary.Write(b, binary.LittleEndian, uint8(0)) // DNAT addr len == 0
+	}
+
 	b.Write(data)
 
 	s.mu.Lock()

@@ -469,7 +469,7 @@ func (t *Wrapper) sendVectorOutbound(r tunVectorReadResult) {
 
 // snatV4 does SNAT on p if it's an IPv4 packet and the destination
 // address requires a different source address.
-func (t *Wrapper) snatV4(p *packet.Parsed) {
+func (t *Wrapper) snatV4(p *packet.Parsed, captureMetadata bool) {
 	if p.IPVersion != 4 {
 		return
 	}
@@ -478,12 +478,12 @@ func (t *Wrapper) snatV4(p *packet.Parsed) {
 	oldSrc := p.Src.Addr()
 	newSrc := nc.selectSrcIP(oldSrc, p.Dst.Addr())
 	if oldSrc != newSrc {
-		p.UpdateSrcAddr(newSrc)
+		p.UpdateSrcAddr(newSrc, captureMetadata)
 	}
 }
 
 // dnatV4 does destination NAT on p if it's an IPv4 packet.
-func (t *Wrapper) dnatV4(p *packet.Parsed) {
+func (t *Wrapper) dnatV4(p *packet.Parsed, captureMetadata bool) {
 	if p.IPVersion != 4 {
 		return
 	}
@@ -492,7 +492,7 @@ func (t *Wrapper) dnatV4(p *packet.Parsed) {
 	oldDst := p.Dst.Addr()
 	newDst := nc.mapDstIP(oldDst)
 	if newDst != oldDst {
-		p.UpdateDstAddr(newDst)
+		p.UpdateDstAddr(newDst, captureMetadata)
 	}
 }
 
@@ -713,17 +713,18 @@ func (t *Wrapper) Read(buffs [][]byte, sizes []int, offset int) (int, error) {
 	var buffsPos int
 	p := parsedPacketPool.Get().(*packet.Parsed)
 	defer parsedPacketPool.Put(p)
+	captHook := t.captureHook.Load()
 	for _, data := range res.data {
 		p.Decode(data[res.dataOffset:])
 
-		t.snatV4(p)
+		t.snatV4(p, captHook != nil)
 		if m := t.destIPActivity.Load(); m != nil {
 			if fn := m[p.Dst.Addr()]; fn != nil {
 				fn()
 			}
 		}
-		if capt := t.captureHook.Load(); capt != nil {
-			capt(capture.FromLocal, time.Now(), p.Buffer())
+		if captHook != nil {
+			captHook(capture.FromLocal, time.Now(), p.Buffer(), p.CaptureMeta)
 		}
 		if !t.disableFilter {
 			response := t.filterPacketOutboundToWireGuard(p)
@@ -773,7 +774,7 @@ func (t *Wrapper) injectedRead(res tunInjectedRead, buf []byte, offset int) (int
 	p := parsedPacketPool.Get().(*packet.Parsed)
 	defer parsedPacketPool.Put(p)
 	p.Decode(buf[offset : offset+n])
-	t.snatV4(p)
+	t.snatV4(p, false)
 
 	if m := t.destIPActivity.Load(); m != nil {
 		if fn := m[p.Dst.Addr()]; fn != nil {
@@ -788,9 +789,9 @@ func (t *Wrapper) injectedRead(res tunInjectedRead, buf []byte, offset int) (int
 	return n, nil
 }
 
-func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed) filter.Response {
-	if capt := t.captureHook.Load(); capt != nil {
-		capt(capture.FromPeer, time.Now(), p.Buffer())
+func (t *Wrapper) filterPacketInboundFromWireGuard(p *packet.Parsed, captHook capture.Callback) filter.Response {
+	if captHook != nil {
+		captHook(capture.FromPeer, time.Now(), p.Buffer(), p.CaptureMeta)
 	}
 
 	if p.IPProto == ipproto.TSMP {
@@ -892,11 +893,12 @@ func (t *Wrapper) Write(buffs [][]byte, offset int) (int, error) {
 	i := 0
 	p := parsedPacketPool.Get().(*packet.Parsed)
 	defer parsedPacketPool.Put(p)
+	captHook := t.captureHook.Load()
 	for _, buff := range buffs {
 		p.Decode(buff[offset:])
-		t.dnatV4(p)
+		t.dnatV4(p, captHook != nil)
 		if !t.disableFilter {
-			if t.filterPacketInboundFromWireGuard(p) != filter.Accept {
+			if t.filterPacketInboundFromWireGuard(p, captHook) != filter.Accept {
 				metricPacketInDrop.Add(1)
 			} else {
 				buffs[i] = buff
@@ -955,10 +957,11 @@ func (t *Wrapper) InjectInboundPacketBuffer(pkt stack.PacketBufferPtr) error {
 	p := parsedPacketPool.Get().(*packet.Parsed)
 	defer parsedPacketPool.Put(p)
 	p.Decode(buf[PacketStartOffset:])
-	if capt := t.captureHook.Load(); capt != nil {
-		capt(capture.SynthesizedToLocal, time.Now(), p.Buffer())
+	captHook := t.captureHook.Load()
+	if captHook != nil {
+		captHook(capture.SynthesizedToLocal, time.Now(), p.Buffer(), p.CaptureMeta)
 	}
-	t.dnatV4(p)
+	t.dnatV4(p, captHook != nil)
 
 	return t.InjectInboundDirect(buf, PacketStartOffset)
 }
@@ -1060,7 +1063,7 @@ func (t *Wrapper) InjectOutboundPacketBuffer(packet stack.PacketBufferPtr) error
 	}
 	if capt := t.captureHook.Load(); capt != nil {
 		b := packet.ToBuffer()
-		capt(capture.SynthesizedToPeer, time.Now(), b.Flatten())
+		capt(capture.SynthesizedToPeer, time.Now(), b.Flatten(), nil)
 	}
 
 	t.injectOutbound(tunInjectedRead{packet: packet})

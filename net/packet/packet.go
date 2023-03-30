@@ -34,6 +34,16 @@ const (
 	TCPECNBits TCPFlag = TCPECNEcho | TCPCWR
 )
 
+// CaptureMeta contains metadata that is used when debugging. It is
+// usually not present on on a Parsed structure unless debugging is
+// enabled.
+type CaptureMeta struct {
+	SNAT        bool           // SNAT was performed & the address was updated.
+	OriginalSrc netip.AddrPort // The source address before SNAT was performed.
+	DNAT        bool           // DNAT was performed & the address was updated.
+	OriginalDst netip.AddrPort // The destination address before DNAT was performed.
+}
+
 // Parsed is a minimal decoding of a packet suitable for use in filters.
 type Parsed struct {
 	// b is the byte buffer that this decodes.
@@ -58,6 +68,11 @@ type Parsed struct {
 	Dst netip.AddrPort
 	// TCPFlags is the packet's TCP flag bits. Valid iff IPProto == TCP.
 	TCPFlags TCPFlag
+
+	// CaptureMeta contains metadata that is used when debugging. It is
+	// usually not present on on a Parsed structure unless debugging is
+	// enabled.
+	CaptureMeta *CaptureMeta
 }
 
 func (p *Parsed) String() string {
@@ -84,6 +99,9 @@ func (p *Parsed) String() string {
 // and shouldn't need any memory allocation.
 func (q *Parsed) Decode(b []byte) {
 	q.b = b
+	if q.CaptureMeta != nil {
+		*q.CaptureMeta = CaptureMeta{} // Clear any capture metadata if it exists.
+	}
 
 	if len(b) < 1 {
 		q.IPVersion = 0
@@ -443,9 +461,17 @@ func (q *Parsed) IsEchoResponse() bool {
 // UpdateSrcAddr updates the source address in the packet buffer (e.g. during
 // SNAT). It also updates the checksum. Currently (2022-12-10) only TCP/UDP/ICMP
 // over IPv4 is supported. It panics if called with IPv6 addr.
-func (q *Parsed) UpdateSrcAddr(src netip.Addr) {
+func (q *Parsed) UpdateSrcAddr(src netip.Addr, captureMetadata bool) {
 	if q.IPVersion != 4 || src.Is6() {
 		panic("UpdateSrcAddr: only IPv4 is supported")
+	}
+
+	if captureMetadata {
+		if q.CaptureMeta == nil {
+			q.CaptureMeta = &CaptureMeta{}
+		}
+		q.CaptureMeta.SNAT = true
+		q.CaptureMeta.OriginalSrc = q.Src
 	}
 
 	old := q.Src.Addr()
@@ -460,9 +486,17 @@ func (q *Parsed) UpdateSrcAddr(src netip.Addr) {
 // UpdateDstAddr updates the source address in the packet buffer (e.g. during
 // DNAT). It also updates the checksum. Currently (2022-12-10) only TCP/UDP/ICMP
 // over IPv4 is supported. It panics if called with IPv6 addr.
-func (q *Parsed) UpdateDstAddr(dst netip.Addr) {
+func (q *Parsed) UpdateDstAddr(dst netip.Addr, captureMetadata bool) {
 	if q.IPVersion != 4 || dst.Is6() {
 		panic("UpdateDstAddr: only IPv4 is supported")
+	}
+
+	if captureMetadata {
+		if q.CaptureMeta == nil {
+			q.CaptureMeta = &CaptureMeta{}
+		}
+		q.CaptureMeta.DNAT = true
+		q.CaptureMeta.OriginalDst = q.Dst
 	}
 
 	old := q.Dst.Addr()

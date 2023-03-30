@@ -2176,7 +2176,7 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc ke
 	// Emit information about the disco frame into the pcap stream
 	// if a capture hook is installed.
 	if cb := c.captureHook.Load(); cb != nil {
-		cb(capture.PathDisco, time.Now(), discoPcapFrame(src, derpNodeSrc, payload))
+		cb(capture.PathDisco, time.Now(), discoPcapFrame(src, derpNodeSrc, payload), nil)
 	}
 
 	dm, err := disco.Parse(payload)
