@@ -185,6 +185,18 @@ func (c *Client) useHTTPS() bool {
 	if c.url != nil && c.url.Scheme == "http" {
 		return false
 	}
+	// Turn on development mode and connect to DERP using plain HTTP.
+	// Questions:
+	// * Should this be a command line option or an envknob?
+	// * If envknob, should it be stubbed out for iOS, etc.?
+	// * Should it be a port number instead of a boolean?
+	// * Should we be able to set the DERP hostname via envknob
+	//   instead of creating a custom derp map in the admin console?
+	// * Is there a better name?
+	if envknob.Bool("TS_DEBUG_DERP_USE_HTTP") {
+		return false
+	}
+
 	return true
 }
 
@@ -200,7 +212,11 @@ func (c *Client) urlString(node *tailcfg.DERPNode) string {
 	if c.url != nil {
 		return c.url.String()
 	}
-	return fmt.Sprintf("https://%s/derp", node.HostName)
+	proto := "https"
+	if envknob.Bool("TS_DEBUG_DERP_USE_HTTP") {
+		proto = "http"
+	}
+	return fmt.Sprintf("%s://%s/derp", proto, node.HostName)
 }
 
 // AddressFamilySelector decides whether IPv6 is preferred for
@@ -644,7 +660,18 @@ func (c *Client) dialNode(ctx context.Context, n *tailcfg.DERPNode) (net.Conn, e
 			}
 			port := "443"
 			if n.DERPPort != 0 {
+				// Question: should the port set in
+				// the tailcfg take precedence or
+				// should the debug envknob? Currently
+				// the tailcfg takes precedence but
+				// that's probably backwards.
 				port = fmt.Sprint(n.DERPPort)
+			} else if envknob.Bool("TS_DEBUG_DERP_USE_HTTP") {
+				// DERP listens on this port with -dev flag
+				// Questions:
+				// * Should this be a shared constant?
+				// * Should the vale of the envknob be the port number?
+				port = "3340"
 			}
 			c, err := c.dialContext(ctx, proto, net.JoinHostPort(dst, port))
 			select {
@@ -725,6 +752,7 @@ func (c *Client) dialNodeUsingProxy(ctx context.Context, n *tailcfg.DERPNode, pr
 		}
 	}()
 
+	// TODO: test TS_DEBUG_DERP_USE_HTTP with http proxies
 	target := net.JoinHostPort(n.HostName, "443")
 
 	var authHeader string
